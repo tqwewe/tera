@@ -104,11 +104,11 @@ impl<'a> CallStack<'a> {
         self.stack.pop().expect("Mistakenly popped Origin frame");
     }
 
-    pub fn lookup(&self, key: &str) -> Option<Val<'a>> {
+    pub fn lookup(&self, key: &str) -> Option<(Val<'a>, bool)> {
         for stack_frame in self.stack.iter().rev() {
             let found = stack_frame.find_value(key);
             if found.is_some() {
-                return found;
+                return found.map(|value| (value, false));
             }
 
             // If we looked in a macro or origin frame, no point continuing
@@ -123,9 +123,9 @@ impl<'a> CallStack<'a> {
             return self
                 .context
                 .find_value_by_pointer(&get_json_pointer(key))
-                .map(|v| Cow::Borrowed(v));
+                .map(|v| (Cow::Borrowed(v), true));
         } else if let Some(value) = self.context.find_value(key) {
-            return Some(Cow::Borrowed(value));
+            return Some((Cow::Borrowed(value), true));
         }
 
         None

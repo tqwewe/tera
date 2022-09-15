@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use std::fmt;
 
+use super::IsDynamic;
+
 /// Whether to remove the whitespace of a `{% %}` tag
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WS {
@@ -96,6 +98,12 @@ pub struct FunctionCall {
     pub args: HashMap<String, Expr>,
 }
 
+impl IsDynamic for FunctionCall {
+    fn is_dynamic(&self) -> bool {
+        self.args.values().any(|arg| arg.is_dynamic())
+    }
+}
+
 /// A mathematical expression
 #[derive(Clone, Debug, PartialEq)]
 pub struct MathExpr {
@@ -107,6 +115,12 @@ pub struct MathExpr {
     pub operator: MathOperator,
 }
 
+impl IsDynamic for MathExpr {
+    fn is_dynamic(&self) -> bool {
+        self.lhs.is_dynamic() || self.rhs.is_dynamic()
+    }
+}
+
 /// A logical expression
 #[derive(Clone, Debug, PartialEq)]
 pub struct LogicExpr {
@@ -116,6 +130,12 @@ pub struct LogicExpr {
     pub rhs: Box<Expr>,
     /// The operator used
     pub operator: LogicOperator,
+}
+
+impl IsDynamic for LogicExpr {
+    fn is_dynamic(&self) -> bool {
+        self.lhs.is_dynamic() || self.rhs.is_dynamic()
+    }
 }
 
 /// Can only be a combination of string + ident or ident + ident
@@ -172,6 +192,26 @@ pub enum ExprVal {
     In(In),
 }
 
+impl IsDynamic for ExprVal {
+    fn is_dynamic(&self) -> bool {
+        match self {
+            ExprVal::String(_) => false,
+            ExprVal::Int(_) => false,
+            ExprVal::Float(_) => false,
+            ExprVal::Bool(_) => false,
+            ExprVal::Ident(_) => true,
+            ExprVal::Math(math_expr) => math_expr.is_dynamic(),
+            ExprVal::Logic(logic_expr) => logic_expr.is_dynamic(),
+            ExprVal::Test(_) => true,
+            ExprVal::MacroCall(_) => todo!(),
+            ExprVal::FunctionCall(_) => todo!(),
+            ExprVal::Array(_) => todo!(),
+            ExprVal::StringConcat(_) => todo!(),
+            ExprVal::In(_) => todo!(),
+        }
+    }
+}
+
 /// An expression is a value that can be negated and followed by
 /// optional filters
 #[derive(Clone, Debug, PartialEq)]
@@ -219,6 +259,12 @@ impl Expr {
     }
 }
 
+impl IsDynamic for Expr {
+    fn is_dynamic(&self) -> bool {
+        self.val.is_dynamic() || self.filters.iter().any(|function_call| function_call.is_dynamic())
+    }
+}
+
 /// A test node `if my_var is odd`
 #[derive(Clone, Debug, PartialEq)]
 pub struct Test {
@@ -241,6 +287,12 @@ pub struct FilterSection {
     pub body: Vec<Node>,
 }
 
+// impl IsDynamic for FilterSection {
+//     fn is_dynamic(&self) -> bool {
+//         self.body.iter().any(|node| node.is_dynamic())
+//     }
+// }
+
 /// Set a variable in the context `{% set val = "hey" %}`
 #[derive(Clone, Debug, PartialEq)]
 pub struct Set {
@@ -251,6 +303,12 @@ pub struct Set {
     /// Whether we want to set the variable globally or locally
     /// global_set is only useful in loops
     pub global: bool,
+}
+
+impl IsDynamic for Set {
+    fn is_dynamic(&self) -> bool {
+        self.value.is_dynamic()
+    }
 }
 
 /// A call to a namespaced macro `macros::my_macro()`
@@ -264,6 +322,12 @@ pub struct MacroCall {
     pub args: HashMap<String, Expr>,
 }
 
+impl IsDynamic for MacroCall {
+    fn is_dynamic(&self) -> bool {
+        self.args.values().any(|expr| expr.is_dynamic())
+    }
+}
+
 /// A Macro definition
 #[derive(Clone, Debug, PartialEq)]
 pub struct MacroDefinition {
@@ -275,6 +339,13 @@ pub struct MacroDefinition {
     pub body: Vec<Node>,
 }
 
+// impl IsDynamic for MacroDefinition {
+//     fn is_dynamic(&self) -> bool {
+//         self.args.values().any(|value| value.map(|expr| expr.is_dynamic()).unwrap_or(false))
+//             || self.body.iter().any(|node| node.is_dynamic())
+//     }
+// }
+
 /// A block definition
 #[derive(Clone, Debug, PartialEq)]
 pub struct Block {
@@ -283,6 +354,12 @@ pub struct Block {
     /// The block content
     pub body: Vec<Node>,
 }
+
+// impl IsDynamic for Block {
+//     fn is_dynamic(&self) -> bool {
+//         self.body.iter().any(|node| node.is_dynamic())
+//     }
+// }
 
 /// A forloop: can be over values or key/values
 #[derive(Clone, Debug, PartialEq)]
@@ -298,6 +375,12 @@ pub struct Forloop {
     /// The body to execute in case of an empty object
     pub empty_body: Option<Vec<Node>>,
 }
+
+// impl IsDynamic for Forloop {
+//     fn is_dynamic(&self) -> bool {
+//         self.container.is_dynamic() || self.body.
+//     }
+// }
 
 /// An if/elif/else condition with their respective body
 #[derive(Clone, Debug, PartialEq)]
@@ -351,3 +434,26 @@ pub enum Node {
     /// The `{# #} `comment tag and its content
     Comment(WS, String),
 }
+
+// impl IsDynamic for Node {
+//     fn is_dynamic(&self) -> bool {
+//         match self {
+//             Node::Super => false,
+//             Node::Text(_) => false,
+//             Node::VariableBlock(_, expr) => expr.is_dynamic(),
+//             Node::MacroDefinition(_, macro_definition, _) => macro_definition.is_dynamic(),
+//             Node::Extends(_, _) => false,
+//             Node::Include(_, _, _) => false,
+//             Node::ImportMacro(_, _, _) => false,
+//             Node::Set(_, set) => set.is_dynamic(),
+//             Node::Raw(_, _, _) => false,
+//             Node::FilterSection(_, filter_section, _) => filter_section.is_dynamic(),
+//             Node::Block(_, block, _) => block.is_dynamic(),
+//             Node::Forloop(_, _, _) => todo!(),
+//             Node::If(_, _) => todo!(),
+//             Node::Break(_) => todo!(),
+//             Node::Continue(_) => todo!(),
+//             Node::Comment(_, _) => todo!(),
+//         }
+//     }
+// }

@@ -57,7 +57,10 @@ pub fn join(value: &Value, args: &HashMap<String, Value>) -> Result<Value> {
     // Convert all the values to strings before we join them together.
     let rendered = arr
         .iter()
-        .map(|v| render_to_string(|| "joining array".to_string(), |w| v.render(w)))
+        .map(|v| {
+            render_to_string(|| "joining array".to_string(), |w| v.render(w).map(|_| false))
+                .map(|(v, _)| v)
+        })
         .collect::<Result<Vec<_>>>()?;
     to_value(&rendered.join(&sep)).map_err(Error::json)
 }

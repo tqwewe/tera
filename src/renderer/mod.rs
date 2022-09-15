@@ -5,7 +5,8 @@ mod tests;
 mod call_stack;
 mod for_loop;
 mod macros;
-mod processor;
+/// TODO
+pub mod processor;
 mod stack_frame;
 
 use std::io::Write;
@@ -53,10 +54,14 @@ impl<'a> Renderer<'a> {
     }
 
     /// Combines the context with the Template to write the end result to output
-    pub fn render_to(&self, mut output: impl Write) -> Result<()> {
-        let mut processor =
-            Processor::new(self.template, self.tera, &self.context, self.should_escape);
+    pub fn render_to(&self, mut output: impl Write) -> Result<bool> {
+        let mut processor = self.processor();
 
         processor.render(&mut output)
+    }
+
+    /// TODO
+    pub fn processor(&self) -> Processor {
+        Processor::new(self.template, self.tera, &self.context, self.should_escape)
     }
 }

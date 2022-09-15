@@ -47,6 +47,10 @@ lazy_static! {
     ]);
 }
 
+pub trait IsDynamic {
+    fn is_dynamic(&self) -> bool;
+}
+
 /// Strings are delimited by double quotes, single quotes and backticks
 /// We need to remove those before putting them in the AST
 fn replace_string_markers(input: &str) -> String {

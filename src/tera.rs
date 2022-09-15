@@ -333,7 +333,7 @@ impl Tera {
         template_name: &str,
         context: &Context,
         write: impl Write,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         let template = self.get_template(template_name)?;
         let renderer = Renderer::new(template, self, context);
         renderer.render_to(write)
