@@ -1,5 +1,11 @@
 # Changelog
 
+## 1.17.1 (2022-09-19)
+
+- Make `get_random` use isize instead of i32 and bad error message
+- Fix variables lookup when the evaluated key has a `.` or quotes
+- Fix changed output of f64 from serde_json 1.0.85
+
 ## 1.17.0 (2022-08-14)
 
 - Fix bug where operands in `in` operation were escaped before comparison

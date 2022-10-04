@@ -38,7 +38,7 @@ fn evaluate_sub_variables<'a>(key: &str, call_stack: &CallStack<'a>) -> Result<(
             }
             Ok((post_var, ud)) => {
                 let post_var_as_str = match *post_var {
-                    Value::String(ref s) => s.to_string(),
+                    Value::String(ref s) => format!(r#""{}""#, s),
                     Value::Number(ref n) => n.to_string(),
                     _ => {
                         return Err(Error::msg(format!(
@@ -838,7 +838,11 @@ impl<'a> Processor<'a> {
                         if res.is_nan() {
                             None
                         } else {
-                            Number::from_f64(res)
+                            if res.round() == res && res.is_finite() {
+                                Some(Number::from(res as i64))
+                            } else {
+                                Number::from_f64(res)
+                            }
                         }
                     }
                     MathOperator::Add => {
