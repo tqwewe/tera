@@ -1,10 +1,12 @@
-use std::io::Write;
-use std::{collections::BTreeMap, iter};
+use std::{borrow::Cow, collections::BTreeMap, fmt::Write, io};
 
 use serde::ser::Serialize;
 use serde_json::value::{to_value, Map, Value};
 
-use crate::errors::{Error, Result as TeraResult};
+use crate::{
+    errors::{Error, Result as TeraResult},
+    renderer::RenderVisitor,
+};
 
 /// The struct that holds the context of a template rendering.
 ///
@@ -136,41 +138,42 @@ impl Default for Context {
 }
 
 pub trait ValueRender {
-    fn render(&self, write: &mut impl Write) -> std::io::Result<()>;
+    fn render(&self, write: &mut impl RenderVisitor, user_defined: bool) -> io::Result<()>;
 }
 
 // Convert serde Value to String.
 impl ValueRender for Value {
-    fn render(&self, write: &mut impl Write) -> std::io::Result<()> {
+    fn render(&self, write: &mut impl RenderVisitor, user_defined: bool) -> io::Result<()> {
         match *self {
-            Value::String(ref s) => write!(write, "{}", s),
+            Value::String(ref s) => write.write_user_defined(Cow::Borrowed(s), user_defined),
             Value::Number(ref i) => {
                 if let Some(v) = i.as_i64() {
-                    write!(write, "{}", v)
+                    write.write_user_defined(Cow::Owned(format!("{v}")), user_defined)
                 } else if let Some(v) = i.as_u64() {
-                    write!(write, "{}", v)
+                    write.write_user_defined(Cow::Owned(format!("{v}")), user_defined)
                 } else if let Some(v) = i.as_f64() {
-                    write!(write, "{}", v)
+                    write.write_user_defined(Cow::Owned(format!("{v}")), user_defined)
                 } else {
                     unreachable!()
                 }
             }
-            Value::Bool(i) => write!(write, "{}", i),
+            Value::Bool(i) => write.write_user_defined(Cow::Owned(format!("{i}")), user_defined),
             Value::Null => Ok(()),
             Value::Array(ref a) => {
                 let mut first = true;
-                write!(write, "[")?;
+                let mut buf = String::new();
+                let _ = write!(buf, "[");
                 for i in a.iter() {
                     if !first {
-                        write!(write, ", ")?;
+                        let _ = write!(buf, ", ");
                     }
                     first = false;
-                    i.render(write)?;
+                    i.render(&mut buf, user_defined)?;
                 }
-                write!(write, "]")?;
-                Ok(())
+                let _ = write!(buf, "]");
+                write.write_user_defined(Cow::Owned(buf), user_defined)
             }
-            Value::Object(_) => write!(write, "[object]"),
+            Value::Object(_) => write.write_user_defined(Cow::Borrowed("[object]"), user_defined),
         }
     }
 }
@@ -226,7 +229,7 @@ pub fn get_json_pointer(key: &str) -> String {
     }
 
     if key.find('"').is_some() {
-        let segments: Vec<&str> = iter::once("")
+        let segments: Vec<&str> = std::iter::once("")
             .chain(JSON_POINTER_REGEX.find_iter(key).map(|mat| mat.as_str().trim_matches('"')))
             .collect();
         segments.join("/")

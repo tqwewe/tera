@@ -8,7 +8,7 @@ mod macros;
 mod processor;
 mod stack_frame;
 
-use std::io::Write;
+use std::{borrow::Cow, io};
 
 use self::processor::Processor;
 use crate::errors::Result;
@@ -53,10 +53,65 @@ impl<'a> Renderer<'a> {
     }
 
     /// Combines the context with the Template to write the end result to output
-    pub fn render_to(&self, mut output: impl Write) -> Result<()> {
+    pub fn render_to(&self, output: &mut impl RenderVisitor) -> Result<bool> {
         let mut processor =
             Processor::new(self.template, self.tera, self.context, self.should_escape);
 
-        processor.render(&mut output)
+        processor.render(output)
     }
+}
+
+/// Render visitor.
+pub trait RenderVisitor {
+    /// Write a static string.
+    fn write_static(&mut self, s: Cow<'_, str>) -> io::Result<()>;
+    /// Write a dynamic string.
+    fn write_dynamic(&mut self, s: Cow<'_, str>) -> io::Result<()>;
+    /// Push for loop frame.
+    fn push_for_loop_frame(&mut self);
+    /// Push if frame.
+    fn push_if_frame(&mut self);
+    /// Pop frame.
+    fn pop(&mut self);
+
+    /// Write user defined string.
+    fn write_user_defined(&mut self, s: Cow<'_, str>, user_defined: bool) -> io::Result<()> {
+        if user_defined {
+            self.write_dynamic(s)
+        } else {
+            self.write_static(s)
+        }
+    }
+}
+
+impl RenderVisitor for Vec<u8> {
+    fn write_static(&mut self, s: Cow<'_, str>) -> io::Result<()> {
+        self.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+
+    fn write_dynamic(&mut self, s: Cow<'_, str>) -> io::Result<()> {
+        self.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+
+    fn push_for_loop_frame(&mut self) {}
+    fn push_if_frame(&mut self) {}
+    fn pop(&mut self) {}
+}
+
+impl RenderVisitor for String {
+    fn write_static(&mut self, s: Cow<'_, str>) -> io::Result<()> {
+        self.push_str(&s);
+        Ok(())
+    }
+
+    fn write_dynamic(&mut self, s: Cow<'_, str>) -> io::Result<()> {
+        self.push_str(&s);
+        Ok(())
+    }
+
+    fn push_for_loop_frame(&mut self) {}
+    fn push_if_frame(&mut self) {}
+    fn pop(&mut self) {}
 }

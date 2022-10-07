@@ -1,6 +1,5 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
-use std::io::Write;
 
 use serde_json::{to_string_pretty, to_value, Number, Value};
 
@@ -17,14 +16,17 @@ use crate::tera::Tera;
 use crate::utils::render_to_string;
 use crate::Context;
 
+use super::RenderVisitor;
+
 /// Special string indicating request to dump context
 static MAGICAL_DUMP_VAR: &str = "__tera_context";
 
 /// This will convert a Tera variable to a json pointer if it is possible by replacing
 /// the index with their evaluated stringified value
-fn evaluate_sub_variables<'a>(key: &str, call_stack: &CallStack<'a>) -> Result<String> {
+fn evaluate_sub_variables<'a>(key: &str, call_stack: &CallStack<'a>) -> Result<(String, bool)> {
     let sub_vars_to_calc = pull_out_square_bracket(key);
     let mut new_key = key.to_string();
+    let mut user_defined = false;
 
     for sub_var in &sub_vars_to_calc {
         // Translate from variable name to variable value
@@ -35,9 +37,9 @@ fn evaluate_sub_variables<'a>(key: &str, call_stack: &CallStack<'a>) -> Result<S
                     key, e
                 )));
             }
-            Ok(post_var) => {
+            Ok((post_var, ud)) => {
                 let post_var_as_str = match *post_var {
-                    Value::String(ref s) => format!(r#""{}""#, s),
+                    Value::String(ref s) => s.to_string(),
                     Value::Number(ref n) => n.to_string(),
                     _ => {
                         return Err(Error::msg(format!(
@@ -57,21 +59,25 @@ fn evaluate_sub_variables<'a>(key: &str, call_stack: &CallStack<'a>) -> Result<S
                     + "."
                     + post_var_as_str.as_ref()
                     + the_parts.next().unwrap_or("");
+                user_defined = ud;
             }
         }
     }
 
-    Ok(new_key
-        .replace('/', "~1") // https://tools.ietf.org/html/rfc6901#section-3
-        .replace("['", ".\"")
-        .replace("[\"", ".\"")
-        .replace('[', ".")
-        .replace("']", "\"")
-        .replace("\"]", "\"")
-        .replace(']', ""))
+    Ok((
+        new_key
+            .replace('/', "~1") // https://tools.ietf.org/html/rfc6901#section-3
+            .replace("['", ".\"")
+            .replace("[\"", ".\"")
+            .replace('[', ".")
+            .replace("']", "\"")
+            .replace("\"]", "\"")
+            .replace(']', ""),
+        user_defined,
+    ))
 }
 
-fn process_path<'a>(path: &str, call_stack: &CallStack<'a>) -> Result<Val<'a>> {
+fn process_path<'a>(path: &str, call_stack: &CallStack<'a>) -> Result<(Val<'a>, bool)> {
     if !path.contains('[') {
         match call_stack.lookup(path) {
             Some(v) => Ok(v),
@@ -82,10 +88,10 @@ fn process_path<'a>(path: &str, call_stack: &CallStack<'a>) -> Result<Val<'a>> {
             ))),
         }
     } else {
-        let full_path = evaluate_sub_variables(path, call_stack)?;
+        let (full_path, user_defined) = evaluate_sub_variables(path, call_stack)?;
 
         match call_stack.lookup(full_path.as_ref()) {
-            Some(v) => Ok(v),
+            Some((v, ud)) => Ok((v, ud || user_defined)),
             None => Err(Error::msg(format!(
                 "Variable `{}` not found in context while rendering '{}': \
                  the evaluated version was `{}`. Maybe the index is out of bounds?",
@@ -147,19 +153,24 @@ impl<'a> Processor<'a> {
         }
     }
 
-    fn render_body(&mut self, body: &'a [Node], write: &mut impl Write) -> Result<()> {
+    fn render_body(&mut self, body: &'a [Node], write: &mut impl RenderVisitor) -> Result<bool> {
+        let mut user_defined = false;
         for n in body {
-            self.render_node(n, write)?;
+            user_defined = self.render_node(n, write)? || user_defined;
 
             if self.call_stack.should_break_body() {
                 break;
             }
         }
 
-        Ok(())
+        Ok(user_defined)
     }
 
-    fn render_for_loop(&mut self, for_loop: &'a Forloop, write: &mut impl Write) -> Result<()> {
+    fn render_for_loop(
+        &mut self,
+        for_loop: &'a Forloop,
+        write: &mut impl RenderVisitor,
+    ) -> Result<bool> {
         let container_name = match for_loop.container.val {
             ExprVal::Ident(ref ident) => ident,
             ExprVal::FunctionCall(FunctionCall { ref name, .. }) => name,
@@ -174,7 +185,7 @@ impl<'a> Processor<'a> {
         let for_loop_body = &for_loop.body;
         let for_loop_empty_body = &for_loop.empty_body;
 
-        let container_val = self.safe_eval_expression(&for_loop.container)?;
+        let (container_val, user_defined) = self.safe_eval_expression(&for_loop.container)?;
 
         let for_loop = match *container_val {
             Value::Array(_) => {
@@ -223,10 +234,14 @@ impl<'a> Processor<'a> {
 
         let len = for_loop.len();
         match (len, for_loop_empty_body) {
-            (0, Some(empty_body)) => self.render_body(empty_body, write),
-            (0, _) => Ok(()),
+            (0, Some(empty_body)) => {
+                self.render_body(empty_body, write)?;
+                Ok(user_defined)
+            }
+            (0, _) => Ok(user_defined),
             (_, _) => {
                 self.call_stack.push_for_loop_frame(for_loop_name, for_loop);
+                write.push_for_loop_frame();
 
                 for _ in 0..len {
                     self.render_body(for_loop_body, write)?;
@@ -238,25 +253,41 @@ impl<'a> Processor<'a> {
                     self.call_stack.increment_for_loop()?;
                 }
 
+                write.pop();
                 self.call_stack.pop();
 
-                Ok(())
+                Ok(user_defined)
             }
         }
     }
 
-    fn render_if_node(&mut self, if_node: &'a If, write: &mut impl Write) -> Result<()> {
+    fn render_if_node(&mut self, if_node: &'a If, write: &mut impl RenderVisitor) -> Result<bool> {
+        let mut user_defined = false;
         for &(_, ref expr, ref body) in &if_node.conditions {
-            if self.eval_as_bool(expr)? {
-                return self.render_body(body, write);
+            let (b, ud) = self.eval_as_bool(expr)?;
+            user_defined = user_defined || ud;
+            if b {
+                write.push_if_frame();
+                user_defined = self.render_body(body, write)? || user_defined;
+                write.pop();
+                return Ok(user_defined);
             }
         }
 
-        if let Some((_, ref body)) = if_node.otherwise {
-            return self.render_body(body, write);
+        match if_node.otherwise {
+            Some((_, ref body)) => {
+                write.push_if_frame();
+                user_defined = self.render_body(body, write)? || user_defined;
+                write.pop();
+                Ok(user_defined)
+            }
+            None => {
+                // write.push_if_frame();
+                write.write_user_defined(Cow::Borrowed(""), user_defined)?;
+                // write.pop();
+                Ok(user_defined)
+            }
         }
-
-        Ok(())
     }
 
     /// The way inheritance work is that the top parent will be rendered by the renderer so for blocks
@@ -266,8 +297,8 @@ impl<'a> Processor<'a> {
         &mut self,
         block: &'a Block,
         level: usize,
-        write: &mut impl Write,
-    ) -> Result<()> {
+        write: &mut impl RenderVisitor,
+    ) -> Result<bool> {
         let level_template = match level {
             0 => self.call_stack.active_template(),
             _ => self
@@ -294,7 +325,7 @@ impl<'a> Processor<'a> {
         self.render_body(&block.body, write)
     }
 
-    fn get_default_value(&mut self, expr: &'a Expr) -> Result<Val<'a>> {
+    fn get_default_value(&mut self, expr: &'a Expr) -> Result<(Val<'a>, bool)> {
         if let Some(default_expr) = expr.filters[0].args.get("value") {
             self.eval_expression(default_expr)
         } else {
@@ -302,9 +333,10 @@ impl<'a> Processor<'a> {
         }
     }
 
-    fn eval_in_condition(&mut self, in_cond: &'a In) -> Result<bool> {
-        let lhs = self.safe_eval_expression(&in_cond.lhs)?;
-        let rhs = self.safe_eval_expression(&in_cond.rhs)?;
+    fn eval_in_condition(&mut self, in_cond: &'a In) -> Result<(bool, bool)> {
+        let (lhs, lhs_ud) = self.safe_eval_expression(&in_cond.lhs)?;
+        let (rhs, rhs_ud) = self.safe_eval_expression(&in_cond.rhs)?;
+        let user_defined = lhs_ud || rhs_ud;
 
         let present = match *rhs {
             Value::Array(ref v) => v.contains(&lhs),
@@ -333,67 +365,84 @@ impl<'a> Processor<'a> {
             }
         };
 
-        Ok(if in_cond.negated { !present } else { present })
+        Ok((if in_cond.negated { !present } else { present }, user_defined))
     }
 
-    fn eval_expression(&mut self, expr: &'a Expr) -> Result<Val<'a>> {
+    fn eval_expression(&mut self, expr: &'a Expr) -> Result<(Val<'a>, bool)> {
         let mut needs_escape = false;
 
-        let mut res = match expr.val {
+        let (mut res, mut user_defined) = match expr.val {
             ExprVal::Array(ref arr) => {
-                let mut values = vec![];
-                for v in arr {
-                    values.push(self.eval_expression(v)?.into_owned());
-                }
-                Cow::Owned(Value::Array(values))
+                let (values, user_defined) =
+                    arr.iter().fold(Result::Ok((vec![], false)), |acc, v| {
+                        let (mut values, user_defined) = acc?;
+                        let (v, ud) = self.eval_expression(v)?;
+                        values.push(v.into_owned());
+                        Ok((values, ud || user_defined))
+                    })?;
+                (Cow::Owned(Value::Array(values)), user_defined)
             }
-            ExprVal::In(ref in_cond) => Cow::Owned(Value::Bool(self.eval_in_condition(in_cond)?)),
+            ExprVal::In(ref in_cond) => {
+                let (in_condition, user_defined) = self.eval_in_condition(in_cond)?;
+                (Cow::Owned(Value::Bool(in_condition)), user_defined)
+            }
             ExprVal::String(ref val) => {
                 needs_escape = true;
-                Cow::Owned(Value::String(val.to_string()))
+                (Cow::Owned(Value::String(val.to_string())), false)
             }
             ExprVal::StringConcat(ref str_concat) => {
                 let mut res = String::new();
+                let mut user_defined = false;
                 for s in &str_concat.values {
                     match *s {
                         ExprVal::String(ref v) => res.push_str(v),
                         ExprVal::Int(ref v) => res.push_str(&format!("{}", v)),
                         ExprVal::Float(ref v) => res.push_str(&format!("{}", v)),
-                        ExprVal::Ident(ref i) => match *self.lookup_ident(i)? {
-                            Value::String(ref v) => res.push_str(v),
-                            Value::Number(ref v) => res.push_str(&v.to_string()),
-                            _ => return Err(Error::msg(format!(
-                                "Tried to concat a value that is not a string or a number from ident {}",
-                                i
-                            ))),
-                        },
-                        ExprVal::FunctionCall(ref fn_call) => match *self.eval_tera_fn_call(fn_call, &mut needs_escape)? {
-                            Value::String(ref v) => res.push_str(v),
-                            Value::Number(ref v) => res.push_str(&v.to_string()),
-                            _ => return Err(Error::msg(format!(
-                                "Tried to concat a value that is not a string or a number from function call {}",
-                                fn_call.name
-                            ))),
-                        },
+                        ExprVal::Ident(ref i) => {
+                            let (v, ud) = self.lookup_ident(i)?;
+                            user_defined = user_defined || ud;
+                            match *v {
+                                Value::String(ref v) => res.push_str(v),
+                                Value::Number(ref v) => res.push_str(&v.to_string()),
+                                _ => return Err(Error::msg(format!(
+                                    "Tried to concat a value that is not a string or a number from ident {}",
+                                    i
+                                ))),
+                            }
+                        }
+                        ExprVal::FunctionCall(ref fn_call) => {
+                            let (val, ud) = self.eval_tera_fn_call(fn_call, &mut needs_escape)?;
+                            user_defined = user_defined || ud;
+                            match *val {
+                                Value::String(ref v) => res.push_str(v),
+                                Value::Number(ref v) => res.push_str(&v.to_string()),
+                                _ => return Err(Error::msg(format!(
+                                    "Tried to concat a value that is not a string or a number from function call {}",
+                                    fn_call.name
+                                ))),
+                            }
+                        }
                         _ => unreachable!(),
                     };
                 }
 
-                Cow::Owned(Value::String(res))
+                (Cow::Owned(Value::String(res)), user_defined)
             }
-            ExprVal::Int(val) => Cow::Owned(Value::Number(val.into())),
-            ExprVal::Float(val) => Cow::Owned(Value::Number(Number::from_f64(val).unwrap())),
-            ExprVal::Bool(val) => Cow::Owned(Value::Bool(val)),
+            ExprVal::Int(val) => (Cow::Owned(Value::Number(val.into())), false),
+            ExprVal::Float(val) => {
+                (Cow::Owned(Value::Number(Number::from_f64(val).unwrap())), false)
+            }
+            ExprVal::Bool(val) => (Cow::Owned(Value::Bool(val)), false),
             ExprVal::Ident(ref ident) => {
                 needs_escape = ident != MAGICAL_DUMP_VAR;
                 // Negated idents are special cased as `not undefined_ident` should not
                 // error but instead be falsy values
                 match self.lookup_ident(ident) {
-                    Ok(val) => {
+                    Ok((val, user_defined)) => {
                         if val.is_null() && expr.has_default_filter() {
                             self.get_default_value(expr)?
                         } else {
-                            val
+                            (val, user_defined)
                         }
                     }
                     Err(e) => {
@@ -404,7 +453,7 @@ impl<'a> Processor<'a> {
                                 return Err(e);
                             }
                             // A negative undefined ident is !false so truthy
-                            return Ok(Cow::Owned(Value::Bool(true)));
+                            return Ok((Cow::Owned(Value::Bool(true)), false));
                         }
                     }
                 }
@@ -413,17 +462,25 @@ impl<'a> Processor<'a> {
                 self.eval_tera_fn_call(fn_call, &mut needs_escape)?
             }
             ExprVal::MacroCall(ref macro_call) => {
-                let val = render_to_string(
+                let (val, user_defined) = render_to_string(
                     || format!("macro {}", macro_call.name),
                     |w| self.eval_macro_call(macro_call, w),
                 )?;
-                Cow::Owned(Value::String(val))
+                (Cow::Owned(Value::String(val)), user_defined)
             }
-            ExprVal::Test(ref test) => Cow::Owned(Value::Bool(self.eval_test(test)?)),
-            ExprVal::Logic(_) => Cow::Owned(Value::Bool(self.eval_as_bool(expr)?)),
+            ExprVal::Test(ref test) => {
+                let (b, user_defined) = self.eval_test(test)?;
+                (Cow::Owned(Value::Bool(b)), user_defined)
+            }
+            ExprVal::Logic(_) => {
+                let (b, user_defined) = self.eval_as_bool(expr)?;
+                (Cow::Owned(Value::Bool(b)), user_defined)
+            }
             ExprVal::Math(_) => match self.eval_as_number(&expr.val) {
-                Ok(Some(n)) => Cow::Owned(Value::Number(n)),
-                Ok(None) => Cow::Owned(Value::String("NaN".to_owned())),
+                Ok((Some(n), user_defined)) => (Cow::Owned(Value::Number(n)), user_defined),
+                Ok((None, user_defined)) => {
+                    (Cow::Owned(Value::String("NaN".to_owned())), user_defined)
+                }
                 Err(e) => return Err(Error::msg(e)),
             },
         };
@@ -432,12 +489,14 @@ impl<'a> Processor<'a> {
             if filter.name == "safe" || filter.name == "default" {
                 continue;
             }
-            res = self.eval_filter(&res, filter, &mut needs_escape)?;
+            (res, user_defined) = self
+                .eval_filter(&res, filter, &mut needs_escape)
+                .map(|(res, ud)| (res, user_defined || ud))?;
         }
 
         // Lastly, we need to check if the expression is negated, thus turning it into a bool
         if expr.negated {
-            return Ok(Cow::Owned(Value::Bool(!res.is_truthy())));
+            return Ok((Cow::Owned(Value::Bool(!res.is_truthy())), user_defined));
         }
 
         // Checks if it's a string and we need to escape it (if the last filter is `safe` we don't)
@@ -447,11 +506,11 @@ impl<'a> Processor<'a> {
             );
         }
 
-        Ok(res)
+        Ok((res, user_defined))
     }
 
     /// Render an expression and never escape its result
-    fn safe_eval_expression(&mut self, expr: &'a Expr) -> Result<Val<'a>> {
+    fn safe_eval_expression(&mut self, expr: &'a Expr) -> Result<(Val<'a>, bool)> {
         let should_escape = self.should_escape;
         self.should_escape = false;
         let res = self.eval_expression(expr);
@@ -460,29 +519,37 @@ impl<'a> Processor<'a> {
     }
 
     /// Evaluate a set tag and add the value to the right context
-    fn eval_set(&mut self, set: &'a Set) -> Result<()> {
-        let assigned_value = self.safe_eval_expression(&set.value)?;
+    fn eval_set(&mut self, set: &'a Set) -> Result<bool> {
+        let (assigned_value, user_defined) = self.safe_eval_expression(&set.value)?;
         self.call_stack.add_assignment(&set.key[..], set.global, assigned_value);
-        Ok(())
+        Ok(user_defined)
     }
 
-    fn eval_test(&mut self, test: &'a Test) -> Result<bool> {
+    fn eval_test(&mut self, test: &'a Test) -> Result<(bool, bool)> {
         let tester_fn = self.tera.get_tester(&test.name)?;
         let err_wrap = |e| Error::call_test(&test.name, e);
 
-        let mut tester_args = vec![];
-        for arg in &test.args {
-            tester_args
-                .push(self.safe_eval_expression(arg).map_err(err_wrap)?.clone().into_owned());
-        }
+        let (tester_args, user_defined) =
+            test.args.iter().fold(Result::Ok((vec![], false)), |acc, arg| {
+                let (mut tester_args, user_defined) = acc?;
+                let (v, ud) = self.safe_eval_expression(arg).map_err(err_wrap)?;
+                tester_args.push(v.clone().into_owned());
+                Ok((tester_args, ud || user_defined))
+            })?;
 
-        let found = self.lookup_ident(&test.ident).map(|found| found.clone().into_owned()).ok();
+        let found = self
+            .lookup_ident(&test.ident)
+            .map(|(found, ud)| (found.clone().into_owned(), ud || user_defined))
+            .ok();
 
-        let result = tester_fn.test(found.as_ref(), &tester_args).map_err(err_wrap)?;
+        let result = tester_fn
+            .test(found.as_ref().map(|(found, _)| found), &tester_args)
+            .map_err(err_wrap)?;
+        let user_defined = found.map(|(_, user_defined)| user_defined).unwrap_or(false);
         if test.negated {
-            Ok(!result)
+            Ok((!result, user_defined))
         } else {
-            Ok(result)
+            Ok((result, user_defined))
         }
     }
 
@@ -490,24 +557,30 @@ impl<'a> Processor<'a> {
         &mut self,
         function_call: &'a FunctionCall,
         needs_escape: &mut bool,
-    ) -> Result<Val<'a>> {
+    ) -> Result<(Val<'a>, bool)> {
         let tera_fn = self.tera.get_function(&function_call.name)?;
         *needs_escape = !tera_fn.is_safe();
 
         let err_wrap = |e| Error::call_function(&function_call.name, e);
 
-        let mut args = HashMap::new();
-        for (arg_name, expr) in &function_call.args {
-            args.insert(
-                arg_name.to_string(),
-                self.safe_eval_expression(expr).map_err(err_wrap)?.clone().into_owned(),
-            );
-        }
+        let (args, user_defined) = function_call.args.iter().fold(
+            Result::Ok((HashMap::new(), false)),
+            |acc, (arg_name, expr)| {
+                let (mut args, user_defined) = acc?;
+                let (v, ud) = self.safe_eval_expression(expr).map_err(err_wrap)?;
+                args.insert(arg_name.to_string(), v.clone().into_owned());
+                Ok((args, ud || user_defined))
+            },
+        )?;
 
-        Ok(Cow::Owned(tera_fn.call(&args).map_err(err_wrap)?))
+        Ok((Cow::Owned(tera_fn.call(&args).map_err(err_wrap)?), user_defined))
     }
 
-    fn eval_macro_call(&mut self, macro_call: &'a MacroCall, write: &mut impl Write) -> Result<()> {
+    fn eval_macro_call(
+        &mut self,
+        macro_call: &'a MacroCall,
+        write: &mut impl RenderVisitor,
+    ) -> Result<bool> {
         let active_template_name = if let Some(block) = self.blocks.last() {
             block.1
         } else if self.template.name != self.template_root.name {
@@ -525,8 +598,9 @@ impl<'a> Processor<'a> {
         let mut frame_context = FrameContext::with_capacity(macro_definition.args.len());
 
         // First the default arguments
+        let mut user_defined = false;
         for (arg_name, default_value) in &macro_definition.args {
-            let value = match macro_call.args.get(arg_name) {
+            let (value, ud) = match macro_call.args.get(arg_name) {
                 Some(val) => self.safe_eval_expression(val)?,
                 None => match *default_value {
                     Some(ref val) => self.safe_eval_expression(val)?,
@@ -539,6 +613,7 @@ impl<'a> Processor<'a> {
                 },
             };
             frame_context.insert(arg_name, value);
+            user_defined = user_defined || ud;
         }
 
         self.call_stack.push_macro_frame(
@@ -548,11 +623,11 @@ impl<'a> Processor<'a> {
             self.tera.get_template(macro_template_name)?,
         );
 
-        self.render_body(&macro_definition.body, write)?;
+        user_defined = self.render_body(&macro_definition.body, write)? || user_defined;
 
         self.call_stack.pop();
 
-        Ok(())
+        Ok(user_defined)
     }
 
     fn eval_filter(
@@ -560,57 +635,74 @@ impl<'a> Processor<'a> {
         value: &Val<'a>,
         fn_call: &'a FunctionCall,
         needs_escape: &mut bool,
-    ) -> Result<Val<'a>> {
+    ) -> Result<(Val<'a>, bool)> {
         let filter_fn = self.tera.get_filter(&fn_call.name)?;
         *needs_escape = !filter_fn.is_safe();
 
         let err_wrap = |e| Error::call_filter(&fn_call.name, e);
 
         let mut args = HashMap::new();
+        let mut user_defined = false;
         for (arg_name, expr) in &fn_call.args {
-            args.insert(
-                arg_name.to_string(),
-                self.safe_eval_expression(expr).map_err(err_wrap)?.clone().into_owned(),
-            );
+            let (value, ud) = self.safe_eval_expression(expr).map_err(err_wrap)?;
+            args.insert(arg_name.to_string(), value.clone().into_owned());
+            user_defined = user_defined || ud;
         }
 
-        Ok(Cow::Owned(filter_fn.filter(value, &args).map_err(err_wrap)?))
+        Ok((Cow::Owned(filter_fn.filter(value, &args).map_err(err_wrap)?), user_defined))
     }
 
-    fn eval_as_bool(&mut self, bool_expr: &'a Expr) -> Result<bool> {
-        let res = match bool_expr.val {
+    fn eval_as_bool(&mut self, bool_expr: &'a Expr) -> Result<(bool, bool)> {
+        let (res, user_defined) = match bool_expr.val {
             ExprVal::Logic(LogicExpr { ref lhs, ref rhs, ref operator }) => {
                 match *operator {
-                    LogicOperator::Or => self.eval_as_bool(lhs)? || self.eval_as_bool(rhs)?,
-                    LogicOperator::And => self.eval_as_bool(lhs)? && self.eval_as_bool(rhs)?,
+                    LogicOperator::Or => {
+                        let (l, l_ud) = self.eval_as_bool(lhs)?;
+                        let (r, r_ud) = self.eval_as_bool(rhs)?;
+                        (l || r, l_ud || r_ud)
+                    }
+                    LogicOperator::And => {
+                        let (l, l_ud) = self.eval_as_bool(lhs)?;
+                        let (r, r_ud) = self.eval_as_bool(rhs)?;
+                        (l && r, l_ud || r_ud)
+                    }
                     LogicOperator::Gt
                     | LogicOperator::Gte
                     | LogicOperator::Lt
                     | LogicOperator::Lte => {
-                        let l = self.eval_expr_as_number(lhs)?;
-                        let r = self.eval_expr_as_number(rhs)?;
-                        let (ll, rr) = match (l, r) {
-                            (Some(nl), Some(nr)) => (nl, nr),
+                        let (l, l_ud) = self.eval_expr_as_number(lhs)?;
+                        let (r, r_ud) = self.eval_expr_as_number(rhs)?;
+                        let (ll, rr, user_defined) = match (l, r) {
+                            (Some(nl), Some(nr)) => (nl, nr, l_ud || r_ud),
                             _ => return Err(Error::msg("Comparison to NaN")),
                         };
 
                         match *operator {
-                            LogicOperator::Gte => ll.as_f64().unwrap() >= rr.as_f64().unwrap(),
-                            LogicOperator::Gt => ll.as_f64().unwrap() > rr.as_f64().unwrap(),
-                            LogicOperator::Lte => ll.as_f64().unwrap() <= rr.as_f64().unwrap(),
-                            LogicOperator::Lt => ll.as_f64().unwrap() < rr.as_f64().unwrap(),
+                            LogicOperator::Gte => {
+                                (ll.as_f64().unwrap() >= rr.as_f64().unwrap(), user_defined)
+                            }
+                            LogicOperator::Gt => {
+                                (ll.as_f64().unwrap() > rr.as_f64().unwrap(), user_defined)
+                            }
+                            LogicOperator::Lte => {
+                                (ll.as_f64().unwrap() <= rr.as_f64().unwrap(), user_defined)
+                            }
+                            LogicOperator::Lt => {
+                                (ll.as_f64().unwrap() < rr.as_f64().unwrap(), user_defined)
+                            }
                             _ => unreachable!(),
                         }
                     }
                     LogicOperator::Eq | LogicOperator::NotEq => {
-                        let mut lhs_val = self.eval_expression(lhs)?;
-                        let mut rhs_val = self.eval_expression(rhs)?;
+                        let (mut lhs_val, lhs_ud) = self.eval_expression(lhs)?;
+                        let (mut rhs_val, rhs_ud) = self.eval_expression(rhs)?;
+                        let user_defined = lhs_ud || rhs_ud;
 
                         // Monomorphize number vals.
                         if lhs_val.is_number() || rhs_val.is_number() {
                             // We're not implementing JS so can't compare things of different types
                             if !lhs_val.is_number() || !rhs_val.is_number() {
-                                return Ok(false);
+                                return Ok((false, user_defined));
                             }
 
                             lhs_val = Cow::Owned(Value::Number(
@@ -622,37 +714,37 @@ impl<'a> Processor<'a> {
                         }
 
                         match *operator {
-                            LogicOperator::Eq => *lhs_val == *rhs_val,
-                            LogicOperator::NotEq => *lhs_val != *rhs_val,
+                            LogicOperator::Eq => (*lhs_val == *rhs_val, user_defined),
+                            LogicOperator::NotEq => (*lhs_val != *rhs_val, user_defined),
                             _ => unreachable!(),
                         }
                     }
                 }
             }
             ExprVal::Ident(_) => {
-                let mut res = self
+                let (res, user_defined) = self
                     .eval_expression(bool_expr)
-                    .unwrap_or(Cow::Owned(Value::Bool(false)))
-                    .is_truthy();
+                    .unwrap_or((Cow::Owned(Value::Bool(false)), false));
+                let mut res = res.is_truthy();
                 if bool_expr.negated {
                     res = !res;
                 }
-                res
+                (res, user_defined)
             }
             ExprVal::Math(_) | ExprVal::Int(_) | ExprVal::Float(_) => {
                 match self.eval_as_number(&bool_expr.val)? {
-                    Some(n) => n.as_f64().unwrap() != 0.0,
-                    None => false,
+                    (Some(n), user_defined) => (n.as_f64().unwrap() != 0.0, user_defined),
+                    (None, user_defined) => (false, user_defined),
                 }
             }
             ExprVal::In(ref in_cond) => self.eval_in_condition(in_cond)?,
             ExprVal::Test(ref test) => self.eval_test(test)?,
-            ExprVal::Bool(val) => val,
-            ExprVal::String(ref string) => !string.is_empty(),
+            ExprVal::Bool(val) => (val, false),
+            ExprVal::String(ref string) => (!string.is_empty(), false),
             ExprVal::FunctionCall(ref fn_call) => {
-                let v = self.eval_tera_fn_call(fn_call, &mut false)?;
+                let (v, user_defined) = self.eval_tera_fn_call(fn_call, &mut false)?;
                 match v.as_bool() {
-                    Some(val) => val,
+                    Some(val) => (val, user_defined),
                     None => {
                         return Err(Error::msg(format!(
                             "Function `{}` was used in a logic operation but is not returning a bool",
@@ -662,30 +754,31 @@ impl<'a> Processor<'a> {
                 }
             }
             ExprVal::StringConcat(_) => {
-                let res = self.eval_expression(bool_expr)?;
-                !res.as_str().unwrap().is_empty()
+                let (res, user_defined) = self.eval_expression(bool_expr)?;
+                (!res.as_str().unwrap().is_empty(), user_defined)
             }
             ExprVal::MacroCall(ref macro_call) => {
                 let mut buf = Vec::new();
-                self.eval_macro_call(macro_call, &mut buf)?;
-                !buf.is_empty()
+                let user_defined = self.eval_macro_call(macro_call, &mut buf)?;
+                (!buf.is_empty(), user_defined)
             }
             _ => unreachable!("unimplemented logic operation for {:?}", bool_expr),
         };
 
         if bool_expr.negated {
-            return Ok(!res);
+            return Ok((!res, user_defined));
         }
 
-        Ok(res)
+        Ok((res, user_defined))
     }
 
     /// In some cases, we will have filters in lhs/rhs of a math expression
     /// `eval_as_number` only works on ExprVal rather than Expr
-    fn eval_expr_as_number(&mut self, expr: &'a Expr) -> Result<Option<Number>> {
+    fn eval_expr_as_number(&mut self, expr: &'a Expr) -> Result<(Option<Number>, bool)> {
         if !expr.filters.is_empty() {
-            match *self.eval_expression(expr)? {
-                Value::Number(ref s) => Ok(Some(s.clone())),
+            let (value, user_defined) = self.eval_expression(expr)?;
+            match *value {
+                Value::Number(ref s) => Ok((Some(s.clone()), user_defined)),
                 _ => {
                     Err(Error::msg("Tried to do math with an expression not resulting in a number"))
                 }
@@ -696,16 +789,16 @@ impl<'a> Processor<'a> {
     }
 
     /// Return the value of an expression as a number
-    fn eval_as_number(&mut self, expr: &'a ExprVal) -> Result<Option<Number>> {
+    fn eval_as_number(&mut self, expr: &'a ExprVal) -> Result<(Option<Number>, bool)> {
         let result = match *expr {
             ExprVal::Ident(ref ident) => {
-                let v = &*self.lookup_ident(ident)?;
+                let (v, user_defined) = self.lookup_ident(ident)?;
                 if v.is_i64() {
-                    Some(Number::from(v.as_i64().unwrap()))
+                    (Some(Number::from(v.as_i64().unwrap())), user_defined)
                 } else if v.is_u64() {
-                    Some(Number::from(v.as_u64().unwrap()))
+                    (Some(Number::from(v.as_u64().unwrap())), user_defined)
                 } else if v.is_f64() {
-                    Some(Number::from_f64(v.as_f64().unwrap()).unwrap())
+                    (Some(Number::from_f64(v.as_f64().unwrap()).unwrap()), user_defined)
                 } else {
                     return Err(Error::msg(format!(
                         "Variable `{}` was used in a math operation but is not a number",
@@ -713,16 +806,16 @@ impl<'a> Processor<'a> {
                     )));
                 }
             }
-            ExprVal::Int(val) => Some(Number::from(val)),
-            ExprVal::Float(val) => Some(Number::from_f64(val).unwrap()),
+            ExprVal::Int(val) => (Some(Number::from(val)), false),
+            ExprVal::Float(val) => (Some(Number::from_f64(val).unwrap()), false),
             ExprVal::Math(MathExpr { ref lhs, ref rhs, ref operator }) => {
-                let (l, r) = match (self.eval_expr_as_number(lhs)?, self.eval_expr_as_number(rhs)?)
-                {
-                    (Some(l), Some(r)) => (l, r),
-                    _ => return Ok(None),
-                };
+                let (l, r, user_defined) =
+                    match (self.eval_expr_as_number(lhs)?, self.eval_expr_as_number(rhs)?) {
+                        ((Some(l), l_ud), (Some(r), r_ud)) => (l, r, l_ud || r_ud),
+                        ((_, l_ud), (_, r_ud)) => return Ok((None, l_ud || r_ud)),
+                    };
 
-                match *operator {
+                let num = match *operator {
                     MathOperator::Mul => {
                         if l.is_i64() && r.is_i64() {
                             let ll = l.as_i64().unwrap();
@@ -763,8 +856,6 @@ impl<'a> Processor<'a> {
                         let res = ll / rr;
                         if res.is_nan() {
                             None
-                        } else if res.round() == res && res.is_finite() {
-                            Some(Number::from(res as i64))
                         } else {
                             Number::from_f64(res)
                         }
@@ -862,11 +953,13 @@ impl<'a> Processor<'a> {
                             Number::from_f64(ll % rr)
                         }
                     }
-                }
+                };
+
+                (num, user_defined)
             }
             ExprVal::FunctionCall(ref fn_call) => {
-                let v = self.eval_tera_fn_call(fn_call, &mut false)?;
-                if v.is_i64() {
+                let (v, user_defined) = self.eval_tera_fn_call(fn_call, &mut false)?;
+                let num = if v.is_i64() {
                     Some(Number::from(v.as_i64().unwrap()))
                 } else if v.is_u64() {
                     Some(Number::from(v.as_u64().unwrap()))
@@ -877,7 +970,8 @@ impl<'a> Processor<'a> {
                         "Function `{}` was used in a math operation but is not returning a number",
                         fn_call.name
                     )));
-                }
+                };
+                (num, user_defined)
             }
             ExprVal::String(ref val) => {
                 return Err(Error::msg(format!("Tried to do math with a string: `{}`", val)));
@@ -903,7 +997,7 @@ impl<'a> Processor<'a> {
     /// Only called while rendering a block.
     /// This will look up the block we are currently rendering and its level and try to render
     /// the block at level + n, where would be the next template in the hierarchy the block is present
-    fn do_super(&mut self, write: &mut impl Write) -> Result<()> {
+    fn do_super(&mut self, write: &mut impl RenderVisitor) -> Result<bool> {
         let &(block_name, _, level) = self.blocks.last().unwrap();
         let mut next_level = level + 1;
 
@@ -918,7 +1012,7 @@ impl<'a> Processor<'a> {
                 let (ref tpl_name, Block { ref body, .. }) = block_def[0];
                 self.blocks.push((block_name, tpl_name, next_level));
 
-                self.render_body(body, write)?;
+                let user_defined = self.render_body(body, write)?;
                 self.blocks.pop();
 
                 // Can't go any higher for that block anymore?
@@ -926,7 +1020,7 @@ impl<'a> Processor<'a> {
                     // then remove it from the stack, we're done with it
                     self.blocks.pop();
                 }
-                return Ok(());
+                return Ok(user_defined);
             } else {
                 next_level += 1;
             }
@@ -936,15 +1030,18 @@ impl<'a> Processor<'a> {
     }
 
     /// Looks up identifier and returns its value
-    fn lookup_ident(&self, key: &str) -> Result<Val<'a>> {
+    fn lookup_ident(&self, key: &str) -> Result<(Val<'a>, bool)> {
         // Magical variable that just dumps the context
         if key == MAGICAL_DUMP_VAR {
             // Unwraps are safe since we are dealing with things that are already Value
-            return Ok(Cow::Owned(
-                to_value(
-                    to_string_pretty(&self.call_stack.current_context_cloned().take()).unwrap(),
-                )
-                .unwrap(),
+            return Ok((
+                Cow::Owned(
+                    to_value(
+                        to_string_pretty(&self.call_stack.current_context_cloned().take()).unwrap(),
+                    )
+                    .unwrap(),
+                ),
+                false,
             ));
         }
 
@@ -953,40 +1050,55 @@ impl<'a> Processor<'a> {
 
     /// Process the given node, appending the string result to the buffer
     /// if it is possible
-    fn render_node(&mut self, node: &'a Node, write: &mut impl Write) -> Result<()> {
-        match *node {
+    pub fn render_node(&mut self, node: &'a Node, write: &mut impl RenderVisitor) -> Result<bool> {
+        let user_defined = match *node {
             // Comments are ignored when rendering
-            Node::Comment(_, _) => (),
-            Node::Text(ref s) | Node::Raw(_, ref s, _) => write!(write, "{}", s)?,
-            Node::VariableBlock(_, ref expr) => self.eval_expression(expr)?.render(write)?,
+            Node::Comment(_, _) => false,
+            Node::Text(ref s) | Node::Raw(_, ref s, _) => {
+                write.write_static(Cow::Borrowed(s))?;
+                false
+            }
+            Node::VariableBlock(_, ref expr) => {
+                let (val, user_defined) = self.eval_expression(expr)?;
+                val.render(write, user_defined)?;
+                user_defined
+            }
             Node::Set(_, ref set) => self.eval_set(set)?,
             Node::FilterSection(_, FilterSection { ref filter, ref body }, _) => {
-                let body = render_to_string(
-                    || format!("filter {}", filter.name),
-                    |w| self.render_body(body, w),
-                )?;
+                let mut buffer = String::new();
+                let user_defined = self.render_body(body, &mut buffer)?;
                 // the safe filter doesn't actually exist
                 if filter.name == "safe" {
-                    write!(write, "{}", body)?;
+                    if user_defined {
+                        write.write_dynamic(Cow::Owned(buffer))?;
+                    } else {
+                        write.write_static(Cow::Owned(buffer))?;
+                    }
+                    user_defined
                 } else {
-                    self.eval_filter(&Cow::Owned(Value::String(body)), filter, &mut false)?
-                        .render(write)?;
+                    let (val, ud) =
+                        self.eval_filter(&Cow::Owned(Value::String(buffer)), filter, &mut false)?;
+                    val.render(write, user_defined)?;
+                    user_defined || ud
                 }
             }
             // Macros have been imported at the beginning
-            Node::ImportMacro(_, _, _) => (),
+            Node::ImportMacro(_, _, _) => false,
             Node::If(ref if_node, _) => self.render_if_node(if_node, write)?,
             Node::Forloop(_, ref forloop, _) => self.render_for_loop(forloop, write)?,
             Node::Break(_) => {
                 self.call_stack.break_for_loop()?;
+                false
             }
             Node::Continue(_) => {
                 self.call_stack.continue_for_loop()?;
+                false
             }
             Node::Block(_, ref block, _) => self.render_block(block, 0, write)?,
             Node::Super => self.do_super(write)?,
             Node::Include(_, ref tpl_names, ignore_missing) => {
                 let mut found = false;
+                let mut user_defined = false;
                 for tpl_name in tpl_names {
                     let template = self.tera.get_template(tpl_name);
                     if template.is_err() {
@@ -995,7 +1107,7 @@ impl<'a> Processor<'a> {
                     let template = template.unwrap();
                     self.macros.add_macros_from_template(self.tera, template)?;
                     self.call_stack.push_include_frame(tpl_name, template);
-                    self.render_body(&template.ast, write)?;
+                    user_defined = self.render_body(&template.ast, write)? || user_defined;
                     self.call_stack.pop();
                     found = true;
                     break;
@@ -1005,6 +1117,7 @@ impl<'a> Processor<'a> {
                         vec!["[", &tpl_names.join(", "), "]"].join(""),
                     ));
                 }
+                user_defined
             }
             Node::Extends(_, ref name) => {
                 return Err(Error::msg(format!(
@@ -1018,7 +1131,7 @@ impl<'a> Processor<'a> {
             }
         };
 
-        Ok(())
+        Ok(user_defined)
     }
 
     /// Helper fn that tries to find the current context: are we in a macro? in a parent template?
@@ -1060,12 +1173,15 @@ impl<'a> Processor<'a> {
     }
 
     /// Entry point for the rendering
-    pub fn render(&mut self, write: &mut impl Write) -> Result<()> {
+    pub fn render(&mut self, write: &mut impl RenderVisitor) -> Result<bool> {
+        let mut user_defined = false;
         for node in &self.template_root.ast {
-            self.render_node(node, write)
-                .map_err(|e| Error::chain(self.get_error_location(), e))?;
+            user_defined = self
+                .render_node(node, write)
+                .map_err(|e| Error::chain(self.get_error_location(), e))?
+                || user_defined;
         }
 
-        Ok(())
+        Ok(user_defined)
     }
 }

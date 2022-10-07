@@ -7,7 +7,6 @@ use std::sync::Arc;
 
 use globwalk::glob_builder;
 
-use crate::builtins::filters::{array, common, number, object, string, Filter};
 use crate::builtins::functions::{self, Function};
 use crate::builtins::testers::{self, Test};
 use crate::context::Context;
@@ -15,6 +14,10 @@ use crate::errors::{Error, Result};
 use crate::renderer::Renderer;
 use crate::template::Template;
 use crate::utils::escape_html;
+use crate::{
+    builtins::filters::{array, common, number, object, string, Filter},
+    renderer::RenderVisitor,
+};
 
 /// Default template name used for `Tera::render_str` and `Tera::one_off`.
 const ONE_OFF_TEMPLATE_NAME: &str = "__tera_one_off";
@@ -332,11 +335,12 @@ impl Tera {
         &self,
         template_name: &str,
         context: &Context,
-        write: impl Write,
+        write: &mut impl RenderVisitor,
     ) -> Result<()> {
         let template = self.get_template(template_name)?;
         let renderer = Renderer::new(template, self, context);
-        renderer.render_to(write)
+        renderer.render_to(write)?;
+        Ok(())
     }
 
     /// Renders a one off template (for example a template coming from a user

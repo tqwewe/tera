@@ -215,8 +215,14 @@ pub fn date(value: &Value, args: &HashMap<String, Value>) -> Result<Value> {
 
 // Returns the given value as a string.
 pub fn as_str(value: &Value, _: &HashMap<String, Value>) -> Result<Value> {
-    let value =
-        render_to_string(|| format!("as_str for value of kind {}", value), |w| value.render(w))?;
+    let value = render_to_string(
+        || format!("as_str for value of kind {}", value),
+        |w| {
+            value.render(w, false)?;
+            Result::Ok(false)
+        },
+    )?
+    .0;
     to_value(value).map_err(Error::json)
 }
 

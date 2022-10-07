@@ -8,7 +8,7 @@ use std::collections::HashMap;
 
 use serde_json::value::{to_value, Value};
 use std::error::Error;
-use tera::{Context, Result, Tera};
+use tera::{Context, Result, StaticDynamicRender, Tera};
 
 lazy_static! {
     pub static ref TEMPLATES: Tera = {
@@ -40,8 +40,9 @@ fn main() {
     // A one off template
     Tera::one_off("hello", &Context::new(), true).unwrap();
 
-    match TEMPLATES.render("users/profile.html", &context) {
-        Ok(s) => println!("{:?}", s),
+    let mut static_dynamic_render = StaticDynamicRender::default();
+    match TEMPLATES.render_to("users/profile.html", &context, &mut static_dynamic_render) {
+        Ok(_) => println!("{static_dynamic_render:#?}"),
         Err(e) => {
             println!("Error: {}", e);
             let mut cause = e.source();

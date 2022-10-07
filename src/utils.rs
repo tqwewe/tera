@@ -35,15 +35,15 @@ pub fn escape_html(input: &str) -> String {
     output
 }
 
-pub(crate) fn render_to_string<C, F, E>(context: C, render: F) -> Result<String, Error>
+pub(crate) fn render_to_string<C, F, E>(context: C, render: F) -> Result<(String, bool), Error>
 where
     C: FnOnce() -> String,
-    F: FnOnce(&mut Vec<u8>) -> Result<(), E>,
+    F: FnOnce(&mut Vec<u8>) -> Result<bool, E>,
     Error: From<E>,
 {
     let mut buffer = Vec::new();
-    render(&mut buffer).map_err(Error::from)?;
-    buffer_to_string(context, buffer)
+    let user_defined = render(&mut buffer).map_err(Error::from)?;
+    buffer_to_string(context, buffer).map(|val| (val, user_defined))
 }
 
 pub(crate) fn buffer_to_string<F>(context: F, buffer: Vec<u8>) -> Result<String, Error>
@@ -79,7 +79,14 @@ mod tests {
     #[test]
     fn test_render_to_string() {
         use std::io::Write;
-        let string = render_to_string(|| panic!(), |w| write!(w, "test")).unwrap();
+        let (string, _) = render_to_string(
+            || panic!(),
+            |w| {
+                write!(w, "test")?;
+                std::io::Result::Ok(false)
+            },
+        )
+        .unwrap();
         assert_eq!(string, "test".to_owned());
     }
 }
